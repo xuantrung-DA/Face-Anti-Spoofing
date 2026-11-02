@@ -1,13 +1,11 @@
-# train_cdcn_improved.py
 # CDCN++ cải tiến (CBAM + MSF + Focal+BCE + Augment) - train & eval & export
-# Usage: python train_cdcn_improved.py
+# See README.md for the required split manifest.
 
+import argparse
+from copy import deepcopy
 import os
-import math
-import time
 import random
 from glob import glob
-from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -15,31 +13,29 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, roc_auc_score
 from tqdm import tqdm
+from data_splits import manifest_datasets
 
 SEED = 2025
-DATA_DIR = "......."  
+# Dataset location and split manifest are explicit CLI arguments.
 IMG_SIZE = 256
 EPOCHS = 5
 BATCH = 32
 LR = 1e-4
 WD = 1e-4
 PATIENCE_ES = 6
-USE_SEED = True
 USE_CUDA = torch.cuda.is_available()
 DEVICE = "cuda" if USE_CUDA else "cpu"
 SAVE_DIR = "./checkpoints_cdcn_improved"
-os.makedirs(SAVE_DIR, exist_ok=True)
-
-if USE_SEED:
-    random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-    if USE_CUDA: torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.benchmark = True
-
 def apcer_bpcer_acer(y_true, y_score, thr):
+    y_true, y_score = np.asarray(y_true), np.asarray(y_score)
+    if y_true.size == 0 or y_true.shape != y_score.shape or set(np.unique(y_true)) != {0, 1}:
+        raise ValueError("PAD evaluation requires equally shaped scores and both classes.")
+    if not np.isfinite(y_score).all() or not 0 <= thr <= 1:
+        raise ValueError("Scores must be finite and threshold must be in [0, 1].")
     y_pred = (y_score >= thr).astype(int)
     fake_m = (y_true==1); real_m = (y_true==0)
     apcer = ((y_pred[fake_m]==0).sum() / max(1, fake_m.sum()))
@@ -57,12 +53,11 @@ def best_thr_by_acer(y_true, y_score):
     return best[1], best[0]
 
 def compute_binary_metrics(y_true, y_score, thr=0.5):
+    y_true, y_score = np.asarray(y_true), np.asarray(y_score)
+    apcer, bpcer, acer = apcer_bpcer_acer(y_true, y_score, thr)
     y_pred = (y_score >= thr).astype(int)
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
     acc = (tp + tn) / (tp + tn + fp + fn)
-    apcer = fp / (tn + fp + 1e-8)
-    bpcer = fn / (tp + fn + 1e-8)
-    acer = 0.5*(apcer+bpcer)
     prec = precision_score(y_true, y_pred, zero_division=0)
     rec = recall_score(y_true, y_pred, zero_division=0)
     f1 = f1_score(y_true, y_pred, zero_division=0)
@@ -187,10 +182,9 @@ class FASDataset(Dataset):
             folder = os.path.join(root_dir, lab_name)
             if not os.path.isdir(folder): continue
             label = 0 if lab_name=="real" else 1 
-            for p in glob(os.path.join(folder, "*")):
+            for p in sorted(glob(os.path.join(folder, "*"))):
                 if p.lower().endswith((".jpg",".jpeg",".png")):
                     self.samples.append((p, label))
-        random.shuffle(self.samples)
 
     def __len__(self): return len(self.samples)
 
@@ -233,7 +227,10 @@ eval_tfms = transforms.Compose([
     transforms.Normalize([0.5]*3, [0.5]*3)
 ])
 
-def evaluate(model, dl, device, use_best_thr=False):
+def evaluate(model, dl, device, *, threshold=None, select_threshold=False):
+    """Select on validation only; test must supply the saved validation threshold."""
+    if select_threshold == (threshold is not None):
+        raise ValueError("Choose validation selection OR an explicit fixed threshold.")
     model.eval()
     all_logits = []
     all_labels = []
@@ -244,39 +241,50 @@ def evaluate(model, dl, device, use_best_thr=False):
             logits = model(imgs)
             all_logits.append(logits.detach().cpu().numpy())
             all_labels.append(labs.cpu().numpy())
+    if not all_logits:
+        raise ValueError("Cannot evaluate an empty split.")
     all_logits = np.concatenate(all_logits, axis=0)
-    probs = 1/(1+np.exp(-all_logits))
+    probs = torch.sigmoid(torch.from_numpy(all_logits)).numpy()
     all_labels = np.concatenate(all_labels, axis=0).astype(int)
     try:
         auc = roc_auc_score(all_labels, probs)
-    except:
+    except ValueError:
         auc = float("nan")
-    thr, acer = best_thr_by_acer(all_labels, probs)
+    thr = best_thr_by_acer(all_labels, probs)[0] if select_threshold else float(threshold)
     metrics = compute_binary_metrics(all_labels, probs, thr)
     metrics['auc'] = auc
     metrics['thr'] = thr
-    metrics['acer_thr'] = acer
+    metrics['acer_thr'] = metrics['acer']
     return metrics, probs, all_labels
 
-def train_loop(data_dir, epochs=EPOCHS, batch_size=BATCH, lr=LR):
+def train_loop(data_dir, epochs=EPOCHS, batch_size=BATCH, lr=LR, *, split_manifest,
+               output_dir=SAVE_DIR, seed=SEED, num_workers=0):
+    if epochs < 1:
+        raise ValueError("epochs must be positive.")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if USE_CUDA:
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    os.makedirs(output_dir, exist_ok=True)
     device = DEVICE
     print("[INFO] Device:", device)
     ds = FASDataset(data_dir, transform=train_tfms)
-    n = len(ds)
-    n_train = int(0.7 * n); n_val = int(0.15 * n); n_test = n - n_train - n_val
-    train_ds, val_ds, test_ds = random_split(ds, [n_train, n_val, n_test])
-    val_ds.dataset.transform = eval_tfms
-    test_ds.dataset.transform = eval_tfms
+    train_ds, val_ds, test_ds = manifest_datasets(
+        ds, data_dir, split_manifest, train_tfms, eval_tfms, real_label=0
+    )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=USE_CUDA)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=USE_CUDA)
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=USE_CUDA)
 
     model = CDCNpp_CBAM().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WD)
     bce = nn.BCEWithLogitsLoss()
     focal = FocalLoss(alpha=0.25, gamma=2.0)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device=="cuda"))
 
     best_acer = 1e9
     best_ckpt = None
@@ -290,7 +298,7 @@ def train_loop(data_dir, epochs=EPOCHS, batch_size=BATCH, lr=LR):
             imgs = imgs.to(device)
             labs = labs.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device=="cuda")):
+            with torch.amp.autocast("cuda", enabled=(device=="cuda")):
                 logits = model(imgs)
                 loss_bce = bce(logits, labs)
                 loss_focal = focal(logits, labs)
@@ -300,18 +308,20 @@ def train_loop(data_dir, epochs=EPOCHS, batch_size=BATCH, lr=LR):
             total_loss += loss.item() * imgs.size(0)
             pbar.set_postfix({'loss': f"{total_loss/((pbar.n+1)*imgs.size(0)):.4f}"})
 
-        val_metrics, val_probs, val_labels = evaluate(model, val_loader, device)
+        val_metrics, val_probs, val_labels = evaluate(model, val_loader, device, select_threshold=True)
         print(f"[EP {ep}] TrainLoss={total_loss/len(train_loader.dataset):.4f} | Val Acc={val_metrics['acc']:.4f} APCER={val_metrics['apcer']:.4f} BPCER={val_metrics['bpcer']:.4f} ACER={val_metrics['acer']:.4f} AUC={val_metrics['auc']:.4f}")
 
         if val_metrics['acer'] + 1e-6 < best_acer:
             best_acer = val_metrics['acer']
             best_ckpt = {
-                'model_state': model.state_dict(),
-                'optimizer_state': optimizer.state_dict(),
+                'model_state': deepcopy(model.state_dict()),
+                'optimizer_state': deepcopy(optimizer.state_dict()),
                 'epoch': ep,
-                'val_metrics': val_metrics
+                'val_metrics': val_metrics,
+                'label_mapping': {'real': 0, 'fake': 1},
+                'seed': seed
             }
-            torch.save(best_ckpt, os.path.join(SAVE_DIR, "best_cdcnpp_cbam.pth"))
+            torch.save(best_ckpt, os.path.join(output_dir, "best_cdcnpp_cbam.pth"))
             print(f"[INFO] New best ACER {best_acer:.5f} saved.")
             no_improve = 0
         else:
@@ -322,14 +332,14 @@ def train_loop(data_dir, epochs=EPOCHS, batch_size=BATCH, lr=LR):
 
     if best_ckpt is not None:
         model.load_state_dict(best_ckpt['model_state'])
-    test_metrics, test_probs, test_labels = evaluate(model, test_loader, device)
+    test_metrics, test_probs, test_labels = evaluate(model, test_loader, device, threshold=best_ckpt['val_metrics']['thr'])
     print("=== FINAL TEST ===")
     print(f"Test: Acc={test_metrics['acc']:.4f}, APCER={test_metrics['apcer']:.4f}, BPCER={test_metrics['bpcer']:.4f}, ACER={test_metrics['acer']:.4f}, AUC={test_metrics['auc']:.4f}, F1={test_metrics['f1']:.4f}")
-    torch.save(model.state_dict(), os.path.join(SAVE_DIR, "cdcnpp_cbam_final.pth"))
+    torch.save(model.state_dict(), os.path.join(output_dir, "cdcnpp_cbam_final.pth"))
     try:
         model_cpu = model.to('cpu').eval()
         dummy = torch.randn(1,3,IMG_SIZE,IMG_SIZE)
-        torch.onnx.export(model_cpu, dummy, os.path.join(SAVE_DIR, "cdcnpp_cbam.onnx"),
+        torch.onnx.export(model_cpu, dummy, os.path.join(output_dir, "cdcnpp_cbam.onnx"),
                           input_names=['input'], output_names=['output'], opset_version=17,
                           dynamic_axes={'input':{0:'batch'}, 'output':{0:'batch'}})
         print("Done")
@@ -338,4 +348,14 @@ def train_loop(data_dir, epochs=EPOCHS, batch_size=BATCH, lr=LR):
 
     return model, test_metrics
 
-# Test: Acc=0.9596, APCER=0.0471, BPCER=0.0339, ACER=0.0405, AUC=0.9920, F1=0.9601
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train CBAM on explicit group-disjoint splits.")
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--split-manifest", required=True)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH)
+    parser.add_argument("--output-dir", default=SAVE_DIR)
+    parser.add_argument("--seed", type=int, default=SEED)
+    args = parser.parse_args()
+    train_loop(args.data_dir, epochs=args.epochs, batch_size=args.batch_size,
+               split_manifest=args.split_manifest, output_dir=args.output_dir, seed=args.seed)

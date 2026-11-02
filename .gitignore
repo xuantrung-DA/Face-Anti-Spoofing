@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+data/
+data_collect/
+splits*.csv
+checkpoints/
+checkpoints_cdcn_improved/
+*.pth
+cdcnpp80k.pt
+*.onnx

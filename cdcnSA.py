@@ -1,14 +1,17 @@
+import argparse
+import random
 import os
 import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 import numpy as np
 from tqdm import tqdm
+from data_splits import manifest_datasets
 
 class Conv2d_cd(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
@@ -100,7 +103,7 @@ class FaceDataset(Dataset):
             folder = os.path.join(root_dir, label_name)
             label = 1 if label_name == "real" else 0
             if not os.path.exists(folder): continue
-            for fname in os.listdir(folder):
+            for fname in sorted(os.listdir(folder)):
                 if fname.lower().endswith(('.jpg', '.png', '.jpeg')):
                     self.samples.append((os.path.join(folder, fname), label))
 
@@ -127,7 +130,18 @@ def compute_metrics(y_true, y_pred):
     f1 = f1_score(y_true, y_pred_bin)
     return acc, apcer, bpcer, acer, prec, rec, f1
 
-def train_model(data_dir, epochs=50, batch_size=16, lr=1e-4):
+def train_model(data_dir, epochs=50, batch_size=16, lr=1e-4, *, split_manifest, seed=2025,
+                output_dir="checkpoints/sa"):
+    if epochs < 1:
+        raise ValueError("epochs must be positive.")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    os.makedirs(output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     transform = transforms.Compose([
         transforms.ToPILImage(),
@@ -137,13 +151,14 @@ def train_model(data_dir, epochs=50, batch_size=16, lr=1e-4):
         transforms.Normalize([0.5]*3, [0.5]*3)
     ])
 
-    full_dataset = FaceDataset(data_dir, transform)
-    total_len = len(full_dataset)
-    train_len = int(0.7 * total_len)
-    val_len = int(0.15 * total_len)
-    test_len = total_len - train_len - val_len
-
-    train_ds, val_ds, test_ds = random_split(full_dataset, [train_len, val_len, test_len])
+    eval_transform = transforms.Compose([
+        transforms.ToPILImage(), transforms.Resize((256, 256)),
+        transforms.ToTensor(), transforms.Normalize([0.5]*3, [0.5]*3)
+    ])
+    full_dataset = FaceDataset(data_dir)
+    train_ds, val_ds, test_ds = manifest_datasets(
+        full_dataset, data_dir, split_manifest, transform, eval_transform, real_label=1
+    )
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
@@ -177,7 +192,7 @@ def train_model(data_dir, epochs=50, batch_size=16, lr=1e-4):
               f"P={prec:.4f}, R={rec:.4f}, F1={f1:.4f}")
 
     # Save model
-    torch.save(model.state_dict(), "cdcnpp80k.pt")
+    torch.save(model.state_dict(), os.path.join(output_dir, "sa_final.pt"))
 
     model.eval()
     preds, gts = [], []
@@ -191,9 +206,13 @@ def train_model(data_dir, epochs=50, batch_size=16, lr=1e-4):
     print(f"Test results: Acc={acc:.4f}, APCER={apcer:.4f}, BPCER={bpcer:.4f}, "
           f"ACER={acer:.4f}, P={prec:.4f}, R={rec:.4f}, F1={f1:.4f}")
     
-# Epoch 1: Loss=0.3072, Acc=0.9096, APCER=0.1442, BPCER=0.0349, ACER=0.0895, P=0.8664, R=0.9651, F1=0.9131
-# Epoch 2: Loss=0.1952, Acc=0.9450, APCER=0.0383, BPCER=0.0722, ACER=0.0553, P=0.9591, R=0.9278, F1=0.9432
-# Epoch 3: Loss=0.1610, Acc=0.9499, APCER=0.0589, BPCER=0.0411, ACER=0.0500, P=0.9404, R=0.9589, F1=0.9496
-# Epoch 4: Loss=0.1433, Acc=0.9601, APCER=0.0313, BPCER=0.0487, ACER=0.0400, P=0.9671, R=0.9513, F1=0.9592
-# Epoch 5: Loss=0.1293, Acc=0.9647, APCER=0.0285, BPCER=0.0423, ACER=0.0354, P=0.9702, R=0.9577, F1=0.9639
-#Test results: Acc=0.9685, APCER=0.0271, BPCER=0.0360, ACER=0.0316, P=0.9716, R=0.9640, F1=0.9678
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train SA on explicit group-disjoint splits.")
+    parser.add_argument("--data-dir", required=True)
+    parser.add_argument("--split-manifest", required=True)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument("--output-dir", default="checkpoints/sa")
+    args = parser.parse_args()
+    train_model(args.data_dir, epochs=args.epochs, split_manifest=args.split_manifest,
+                seed=args.seed, output_dir=args.output_dir)
